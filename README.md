@@ -1,0 +1,2 @@
+# AI-calculator
+Gemini / Groq
