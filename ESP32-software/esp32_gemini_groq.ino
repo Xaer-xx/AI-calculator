@@ -1,13 +1,3 @@
-/*
-  ESP32-S3: lokálny web s AI asistentom
-  - na webe (http://<IP adresa ESP32>) zadáš úlohu a dostaneš odpoveď
-  - ESP32 najprv zavolá Gemini API
-  - ak Gemini zlyhá (chyba, limit 429, zlý kľúč, timeout, prázdna odpoveď), prepne na Groq
-
-  Potrebná knižnica (Správca knižníc v Arduino IDE): ArduinoJson (verzia 7.x, autor Benoit Blanchon)
-  Ostatné knižnice (WiFi, WebServer, HTTPClient, WiFiClientSecure, ESPmDNS) sú súčasťou ESP32 jadra.
-*/
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -15,22 +5,12 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// WiFi meno/heslo a API kľúče sú v súbore secrets.h (nie je na GitHube).
-// Ak chýba: skopíruj secrets.example.h ako secrets.h a vyplň ho.
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
 #error "Chýba secrets.h – skopíruj secrets.example.h ako secrets.h a vyplň svoje kľúče."
 #endif
 
-// ====================== NASTAVENIA ======================
-// Zoznam modelov = tlačidlá na stránke. Na stránke si vyberieš, ktorý sa skúsi PRVÝ;
-// keď zlyhá (preťaženie 503/429, timeout, chyba), skúšajú sa ostatné v poradí tohto zoznamu.
-// "groq" znamená Groq s modelom GROQ_MODEL, ostatné sú Gemini modely.
-// Pozor: gemini-3.8-flash je často preťažený (odpoveď > 40 s alebo chyba 503), preto je na konci.
-// gemini-2.5-* už pre nových používateľov nefungujú (404).
-// Druhý údaj je krátky popis, ktorý sa zobrazí pod tlačidlom.
-// Rýchlosť je nameraná (nov. 2026, úloha zo slovnej matematiky); sila je odhad podľa generácie modelu.
 struct ModelInfo { const char* id; const char* note; };
 const ModelInfo MODELS[] = {
   { "gemini-3.5-flash",      "vyvážený · ~5 s" },
@@ -39,13 +19,13 @@ const ModelInfo MODELS[] = {
   { "gemini-3.8-flash",      "💪 najsilnejší · často preťažený" },
 };
 const size_t MODEL_COUNT = sizeof(MODELS) / sizeof(MODELS[0]);
-const char* GEMINI_THINKING = "low";              // "minimal" / "low" / "medium" / "high"; "" = nenastavovať
-const uint16_t GEMINI_TIMEOUT_MS = 20000;         // čakanie na odpoveď z jedného modelu
+const char* GEMINI_THINKING = "low";
+const uint16_t GEMINI_TIMEOUT_MS = 20000;
 
 const char* GROQ_MODEL   = "openai/gpt-oss-120b";
-const bool  GROQ_REASONING_LOW = true;           // true len pre gpt-oss modely, pre ostatné daj false
+const bool  GROQ_REASONING_LOW = true;
 
-const int    GEMINI_MAX_TOKENS = 2048;           // limit zahŕňa aj "premýšľanie" modelu
+const int    GEMINI_MAX_TOKENS = 2048;
 const int    GROQ_MAX_TOKENS   = 1024;
 const size_t MAX_PROMPT_CHARS  = 2000;
 
@@ -58,11 +38,9 @@ const char* SYSTEM_PROMPT =
   "Formát pri matematike a logike: riadok 'Postup:' a pod ním očíslované kroky, "
   "potom na konci samostatný riadok 'Výsledok: ...'. "
   "Formát pri gramatike: riadok 'Odpoveď: ...' a potom riadok 'Pravidlo: ...' s jednou vetou.";
-// ===================================================================
 
 WebServer server(80);
 
-// ---------------------- webová stránka ----------------------
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="sk">
@@ -93,7 +71,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <script>
 const b=document.getElementById('b'),p=document.getElementById('p'),o=document.getElementById('out'),m=document.getElementById('meta');
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-// Tlačidlá na výber modelu, ktorý sa skúsi ako prvý (voľba sa pamätá v prehliadači).
 const mb=document.getElementById('models');
 let first='';
 try{ first=localStorage.getItem('first')||''; }catch(e){}
@@ -112,8 +89,6 @@ fetch('/models').then(r=>r.json()).then(d=>{
   }
   pick(d.models.some(md=>md.id===first)?first:d.models[0].id);
 }).catch(()=>{ mb.textContent='Zoznam modelov sa nenačítal, použije sa predvolené poradie.'; });
-// Knižnica na vzorce (KaTeX) sa načíta až vtedy, keď odpoveď obsahuje LaTeX.
-// Stránka a tlačidlo tak nikdy nečakajú na internet.
 let katexReady=null;
 function loadKatex(){
   if(katexReady) return katexReady;
@@ -138,10 +113,8 @@ function loadKatex(){
   return katexReady;
 }
 async function show(text){
-  // bezpečné zobrazenie: najprv escapovanie HTML, potom jednoduché **tučné** a nadpisy
   let h=esc(text).replace(/^#{1,6}\s*(.+)$/gm,'<b>$1</b>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
   o.innerHTML=h;
-  // ak model napriek pokynu pošle LaTeX, vykreslí sa ako vzorec (potrebuje internet v prehliadači)
   if(/\\\[|\\\(|\$\$|\\boxed|\\frac|\\text\{|\$[^$\n]+\$/.test(text)){
     if(await loadKatex()){
       try{
@@ -159,7 +132,6 @@ async function ask(){
   const prompt=p.value.trim();
   if(!prompt) return;
   b.disabled=true; o.textContent='';
-  // čas vypracovania: od kliknutia na Odoslať po príchod odpovede
   const t0=performance.now();
   const secs=()=>((performance.now()-t0)/1000).toFixed(1).replace('.',',')+' s';
   m.textContent='Počítam... 0,0 s';
@@ -189,9 +161,6 @@ p.addEventListener('keydown',e=>{ if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)) as
 </html>
 )rawliteral";
 
-// ---------------------- pomocné funkcie ----------------------
-
-// Skráti text a neprereže UTF-8 znak v strede.
 String cutUtf8(const String& s, size_t maxLen) {
   if (s.length() <= maxLen) return s;
   size_t n = maxLen;
@@ -199,7 +168,6 @@ String cutUtf8(const String& s, size_t maxLen) {
   return s.substring(0, n) + "...";
 }
 
-// Z chybovej odpovede API vytiahne text správy.
 String apiError(int code, const String& payload) {
   if (code <= 0) return String("spojenie zlyhalo (") + HTTPClient::errorToString(code) + ")";
   JsonDocument filter;
@@ -212,12 +180,11 @@ String apiError(int code, const String& payload) {
   return "HTTP " + String(code);
 }
 
-// Spoločné HTTPS POST volanie. Vráti HTTP kód (alebo zápornú hodnotu pri chybe spojenia).
 int httpsPost(const String& url, const char* headerName, const String& headerValue,
               const String& body, String& payload, uint16_t timeoutMs) {
   WiFiClientSecure client;
-  client.setInsecure();  // NEoveruje certifikát servera (jednoduché, ale menej bezpečné)
-  client.setTimeout(timeoutMs / 1000);  // sekundy
+  client.setInsecure();
+  client.setTimeout(timeoutMs / 1000);
   HTTPClient http;
   http.setConnectTimeout(10000);
   http.setTimeout(timeoutMs);
@@ -230,7 +197,6 @@ int httpsPost(const String& url, const char* headerName, const String& headerVal
   return code;
 }
 
-// ---------------------- Gemini ----------------------
 bool callGemini(const char* model, const String& prompt, String& answer, String& err) {
   if (strlen(GEMINI_KEY) == 0 || strncmp(GEMINI_KEY, "SEM_", 4) == 0) {
     err = "chýba Gemini kľúč";
@@ -279,7 +245,6 @@ bool callGemini(const char* model, const String& prompt, String& answer, String&
   return true;
 }
 
-// ---------------------- Groq ----------------------
 bool callGroq(const String& prompt, String& answer, String& err) {
   if (strlen(GROQ_KEY) == 0 || strncmp(GROQ_KEY, "SEM_", 4) == 0) {
     err = "chýba Groq kľúč";
@@ -326,7 +291,6 @@ bool callGroq(const String& prompt, String& answer, String& err) {
   return true;
 }
 
-// ---------------------- výber modelu ----------------------
 bool isGroq(const char* id) { return strcmp(id, "groq") == 0; }
 
 String modelLabel(const char* id) {
@@ -339,7 +303,6 @@ bool callModel(const char* id, const String& prompt, String& answer, String& err
   return callGemini(id, prompt, answer, err);
 }
 
-// ---------------------- web handlery ----------------------
 void sendJson(int status, JsonDocument& doc) {
   String out;
   serializeJson(doc, out);
@@ -371,7 +334,6 @@ void handleAsk() {
     return;
   }
 
-  // poradie: najprv model zvolený na stránke, potom ostatné podľa zoznamu MODELS
   String first = in["first"] | "";
   const char* order[MODEL_COUNT];
   size_t n = 0;
@@ -403,7 +365,6 @@ void handleAsk() {
   sendError(502, "Zlyhali všetky modely.\n" + errors);
 }
 
-// Zoznam modelov pre tlačidlá na stránke.
 void handleModels() {
   JsonDocument res;
   for (size_t i = 0; i < MODEL_COUNT; i++) {
@@ -414,7 +375,6 @@ void handleModels() {
   sendJson(200, res);
 }
 
-// ---------------------- setup / loop ----------------------
 void setup() {
   Serial.begin(115200);
   delay(500);
