@@ -4,6 +4,9 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <vector>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -41,6 +44,16 @@ const char* SYSTEM_PROMPT =
 
 WebServer server(80);
 
+const uint8_t LCD_SDA = 4;
+const uint8_t LCD_SCL = 5;
+const uint8_t LCD_COLS = 16;
+const uint16_t LCD_PAGE_MS = 3000;
+LiquidCrystal_I2C* lcd = nullptr;
+std::vector<String> lcdLines;
+size_t lcdPos = 0;
+uint32_t lcdLastPage = 0;
+bool lcdNeedReinit = false;
+
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="sk">
@@ -66,14 +79,17 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <div id="models">Ako prvý:</div>
 <textarea id="p" placeholder="Zadaj úlohu (matematika, logika, gramatika SK/EN)... Ctrl+Enter odošle."></textarea>
 <button id="b">Odoslať</button>
+<label style="margin-left:12px;font-size:14px;color:#9ca3af"><input type="checkbox" id="lcd"> Vypísať odpoveď na LCD</label>
 <div id="meta"></div>
 <div id="out"></div>
 <script>
 const b=document.getElementById('b'),p=document.getElementById('p'),o=document.getElementById('out'),m=document.getElementById('meta');
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 const mb=document.getElementById('models');
+const lc=document.getElementById('lcd');
 let first='';
-try{ first=localStorage.getItem('first')||''; }catch(e){}
+try{ first=localStorage.getItem('first')||''; lc.checked=localStorage.getItem('lcd')==='1'; }catch(e){}
+lc.onchange=()=>{ try{ localStorage.setItem('lcd',lc.checked?'1':'0'); }catch(e){} };
 function pick(id){
   first=id;
   try{ localStorage.setItem('first',id); }catch(e){}
@@ -137,7 +153,7 @@ async function ask(){
   m.textContent='Počítam... 0,0 s';
   const tick=setInterval(()=>{ m.textContent='Počítam... '+secs(); },100);
   try{
-    const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,first})});
+    const r=await fetch('/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt,first,lcd:lc.checked})});
     const d=await r.json();
     clearInterval(tick);
     if(d.ok){
@@ -316,6 +332,173 @@ void sendError(int status, const String& message) {
   sendJson(status, res);
 }
 
+String lcdFold(String s) {
+  static const char* const MAP[][2] = {
+    {"á","a"},{"ä","a"},{"č","c"},{"ď","d"},{"é","e"},{"ě","e"},{"í","i"},{"ĺ","l"},{"ľ","l"},
+    {"ň","n"},{"ó","o"},{"ô","o"},{"ö","o"},{"ŕ","r"},{"ř","r"},{"š","s"},{"ť","t"},{"ú","u"},
+    {"ü","u"},{"ý","y"},{"ž","z"},{"Á","A"},{"Ä","A"},{"Č","C"},{"Ď","D"},{"É","E"},{"Í","I"},
+    {"Ĺ","L"},{"Ľ","L"},{"Ň","N"},{"Ó","O"},{"Ô","O"},{"Ŕ","R"},{"Š","S"},{"Ť","T"},{"Ú","U"},
+    {"Ý","Y"},{"Ž","Z"},{"×","x"},{"÷","/"},{"√","sqrt"},{"²","^2"},{"³","^3"},{"≈","~"},
+    {"≤","<="},{"≥",">="},{"≠","!="},{"π","pi"},{"−","-"},{"–","-"},{"—","-"},{"·","*"},
+    {"„","\""},{"“","\""},{"”","\""},{"’","'"},{"…","..."}
+  };
+  for (const auto& m : MAP) s.replace(m[0], m[1]);
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '\n') out += '\n';
+    else if (c == '\t') out += ' ';
+    else if (c >= 32 && c < 127) out += c;
+  }
+  return out;
+}
+
+const size_t LCD_MAX_LINES = 120;
+
+void lcdPush(const String& s) {
+  if (lcdLines.size() < LCD_MAX_LINES) lcdLines.push_back(s);
+}
+
+bool isDig(char c) { return c >= '0' && c <= '9'; }
+
+size_t lcdBreakPos(const String& w) {
+  for (size_t k = LCD_COLS; k >= 3; k--) {
+    char a = w[k - 1], b = w[k];
+    if (b == '(' && k > 1) return k;
+    if (strchr("=+*/;:)", a)) return k;
+    if (a == '-' && !strchr("=+-*/(", w[k - 2])) return k;
+    if ((a == ',' || a == '.') && !(isDig(w[k - 2]) && isDig(b))) return k;
+  }
+  size_t k = LCD_COLS;
+  while (k > 1 && isDig(w[k - 1]) && (isDig(w[k]) || w[k] == ',' || w[k] == '.')) k--;
+  while (k > 1 && (w[k - 1] == ',' || w[k - 1] == '.') && isDig(w[k - 2])) {
+    k--;
+    while (k > 1 && isDig(w[k - 1])) k--;
+  }
+  return k > 1 ? k : LCD_COLS;
+}
+
+void lcdWrap(const String& text) {
+  String line;
+  int i = 0, len = text.length();
+  while (i < len && lcdLines.size() < LCD_MAX_LINES) {
+    while (i < len && text[i] == ' ') i++;
+    int j = i;
+    while (j < len && text[j] != ' ') j++;
+    String word = text.substring(i, j);
+    i = j;
+    if (word.length() == 0) break;
+
+    if (word.length() > LCD_COLS) {
+      if (line.length()) { lcdPush(line); line = ""; }
+      std::vector<String> parts;
+      while (word.length() > LCD_COLS) {
+        size_t k = lcdBreakPos(word);
+        parts.push_back(word.substring(0, k));
+        word = word.substring(k);
+      }
+      if (parts.size() == 1 && lcdLines.size() % 2 == 1) lcdPush("");
+      for (const String& part : parts) lcdPush(part);
+      line = word;
+      continue;
+    }
+
+    if (line.length() && line.length() + 1 + word.length() > LCD_COLS) {
+      lcdPush(line);
+      line = "";
+    }
+    if (line.length()) line += ' ';
+    line += word;
+  }
+  if (line.length()) lcdPush(line);
+}
+
+void lcdSetText(const String& answer) {
+  String text = lcdFold(answer);
+  text.replace("**", "");
+  text.replace("$", "");
+
+  lcdLines.clear();
+  int start = 0, len = text.length();
+  while (start < len && lcdLines.size() < LCD_MAX_LINES) {
+    int nl = text.indexOf('\n', start);
+    if (nl < 0) nl = len;
+    lcdWrap(text.substring(start, nl));
+    start = nl + 1;
+  }
+  if (lcdLines.empty()) lcdLines.push_back("(prazdna)");
+  if (lcdLines.size() % 2) lcdLines.push_back("");
+
+  lcdPos = 0;
+  lcdLastPage = 0;
+  lcdNeedReinit = true;
+}
+
+void lcdReinit() {
+  if (!lcd) return;
+  lcd->init();
+  lcd->noCursor();
+  lcd->noBlink();
+  lcd->backlight();
+}
+
+void lcdRow(uint8_t row, String text) {
+  while (text.length() < LCD_COLS) text += ' ';
+  text = text.substring(0, LCD_COLS);
+  lcd->setCursor(0, row);
+  lcd->print(text);
+}
+
+void lcdShowPage() {
+  lcdRow(0, lcdLines[lcdPos]);
+  lcdRow(1, lcdLines[lcdPos + 1]);
+}
+
+void lcdMessage(const String& l1, const String& l2 = "") {
+  if (!lcd) return;
+  lcdRow(0, l1);
+  lcdRow(1, l2);
+}
+
+void lcdSetup() {
+  Wire.begin(LCD_SDA, LCD_SCL);
+  Wire.setClock(100000);
+  delay(100);
+
+  uint8_t found = 0;
+  Serial.print("I2C sken (SDA=" + String(LCD_SDA) + ", SCL=" + String(LCD_SCL) + "):");
+  for (uint8_t a = 0x08; a < 0x78; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      Serial.printf(" 0x%02X", a);
+      if (!found && ((a >= 0x20 && a <= 0x27) || (a >= 0x38 && a <= 0x3F))) found = a;
+    }
+  }
+  Serial.println();
+
+  if (!found) {
+    Serial.println("LCD sa na I2C nenašlo -> skontroluj zapojenie SDA/SCL, GND a napájanie 5V.");
+    return;
+  }
+  Serial.printf("LCD nájdené na adrese 0x%02X\n", found);
+  lcd = new LiquidCrystal_I2C(found, LCD_COLS, 2);
+  lcdReinit();
+}
+
+void lcdTick() {
+  if (!lcd || lcdLines.empty()) return;
+  if (lcdNeedReinit) {
+    lcdNeedReinit = false;
+    lcdReinit();
+  }
+  if (lcdLastPage != 0 && millis() - lcdLastPage < LCD_PAGE_MS) return;
+  if (lcdLastPage != 0 && lcdLines.size() <= 2) return;
+  if (lcdLastPage != 0) lcdPos = (lcdPos + 2) % lcdLines.size();
+  lcdShowPage();
+  lcdLastPage = millis();
+  if (lcdLastPage == 0) lcdLastPage = 1;
+}
+
 void handleAsk() {
   JsonDocument in;
   if (deserializeJson(in, server.arg("plain"))) {
@@ -353,6 +536,7 @@ void handleAsk() {
       if (errors.length()) res["note"] = "zlyhalo: " + errors;
       res["answer"] = answer;
       sendJson(200, res);
+      if (in["lcd"] | false) lcdSetText(answer);
       return;
     }
     Serial.println("  zlyhalo: " + err);
@@ -378,6 +562,11 @@ void handleModels() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  Serial.printf("\nŠtart, dôvod resetu: %d (1=zapnutie, 3=softvér, 4/7=pád, 9=brownout/slabé napájanie)\n",
+                (int)esp_reset_reason());
+
+  lcdSetup();
+  lcdMessage("Pripajam WiFi...");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -394,6 +583,8 @@ void setup() {
   Serial.println();
   Serial.print("Hotovo. Otvor v prehliadači: http://");
   Serial.println(WiFi.localIP());
+  lcdReinit();
+  lcdMessage("WiFi OK, IP:", WiFi.localIP().toString());
 
   if (MDNS.begin("esp32-ai")) {
     Serial.println("alebo http://esp32-ai.local");
@@ -408,4 +599,5 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  lcdTick();
 }
